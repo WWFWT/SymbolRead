@@ -3,6 +3,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Net;
 using System.Text;
 using System.Threading.Tasks;
 using Zodiacon.DebugHelp;
@@ -11,59 +12,139 @@ namespace ConsoleApp1
 {
     class Program
     {
-        public static SymbolHandler SymbolHandler { get; private set; }
-        public static ICollection<SymbolInfo> symbols;
-        public static IList<SymbolInfo> types;
-        public static ulong BaseAddress;
-        private static ResourceDownloader downloader = new ResourceDownloader();
+        public static SymbolHandler symbolHandler { get; private set; }
+        public static ulong baseAddress = 0;
 
-        private static async Task LoadSymbol()
+        static string BuildUrl(string fileFullPath)
         {
-            string filename = "C:\\localsymbols\\ntkrnlmp.pdb\\BD8C7CDE0D907F0F5554F160B99CA6021\\ntkrnlmp.pdb";
+            PeHeaderReader reader = new PeHeaderReader(fileFullPath);
+            string pdbName;
+
+            if(string.IsNullOrEmpty(reader.pdbName)) {
+                return "";
+            }
+
+            if (reader.pdbName.Contains("\\")) {
+                string[] tmp = reader.pdbName.Split('\\');
+                pdbName = (tmp[tmp.Length - 1]);
+            } else {
+                pdbName = reader.pdbName;
+            }
+
+            return "http://msdl.microsoft.com/download/symbols/" +
+                pdbName + "/" + reader.debugGUID.ToString("N").ToUpper() + reader.pdbage + "/" + pdbName;
+        }
+
+        static bool HttpDownload(string url, string path, ref float progress)
+        {
+            string tempFilePath = System.IO.Path.GetDirectoryName(path) + ".temp";
+            if (System.IO.File.Exists(tempFilePath)) {
+                System.IO.File.Delete(tempFilePath);
+            }
+
+            try
+            {
+                FileStream fs = new FileStream(tempFilePath, FileMode.Append, FileAccess.Write, FileShare.ReadWrite);
+                HttpWebRequest request = WebRequest.Create(url) as HttpWebRequest;
+                request.Method = "GET";
+                HttpWebResponse response = request.GetResponse() as HttpWebResponse;
+                Stream responseStream = response.GetResponseStream();
+
+                byte[] bArr = new byte[1024];
+                int size = responseStream.Read(bArr, 0, (int)bArr.Length);
+                long newSize = 0;
+                long allSize = response.ContentLength;
+
+                while (size > 0) {
+                    fs.Write(bArr, 0, size);
+                    size = responseStream.Read(bArr, 0, (int)bArr.Length);
+                    newSize += size;
+                    progress = ((float)newSize) / ((float)allSize);
+                }
+                fs.Close();
+                responseStream.Close();
+                
+                if (System.IO.File.Exists(path)) {
+                    System.IO.File.Delete(path);
+                }
+                System.IO.File.Move(tempFilePath, path);
+                System.IO.File.Delete(tempFilePath);
+                return true;
+            } 
+            catch (Exception e) 
+            {
+                Console.WriteLine(e.Message);
+                return false;
+            }
+        }
+
+        private static Dictionary<string, SymbolInfo> LoadSymbol()
+        {
+            string filename = "../../ntkrnlmp.pdb";
             var isPdb = Path.GetExtension(filename).Equals(".pdb", StringComparison.InvariantCultureIgnoreCase);
-            var handler = SymbolHandler.Create();
-            BaseAddress = await handler.TryLoadSymbolsForModuleAsync(filename, isPdb ? 0x1000000UL : 0);
-            SymbolHandler = handler;
 
-            symbols = await Task.Run(() => SymbolHandler.EnumSymbols(BaseAddress));
-            symbols = await Task.Run(() => SymbolHandler.EnumSymbols(BaseAddress));
-            types = SymbolHandler.EnumTypes(BaseAddress);
+            symbolHandler = SymbolHandler.Create();
+            baseAddress = symbolHandler.TryLoadSymbolsForModuleAsync(filename, isPdb ? 0x1000000UL : 0).Result;
             
+
+            ICollection<SymbolInfo> symbols = symbolHandler.EnumSymbols(baseAddress);
+            IList<SymbolInfo> types = symbolHandler.EnumTypes(baseAddress);
+
+            Dictionary<string, SymbolInfo> res = new Dictionary<string, SymbolInfo>();
+            foreach(var symbol in symbols) {
+                if (!res.ContainsKey(symbol.Name))
+                {
+                    res.Add(symbol.Name, symbol);
+                }
+            }
+            foreach(var type in types) {
+                if (!res.ContainsKey(type.Name))
+                {
+                    res.Add(type.Name, type);
+                }
+            }
+
+            return res;
         }
 
-        private static void TestReadSymbol()
+        static StructDescriptor GetStruct(SymbolInfo type)
         {
-            LoadSymbol();
-            Console.ReadLine();
-            foreach (var i in symbols)
-            {
-                Console.WriteLine("symbol name:" + i.Name + " | 偏移地址:" + (i.Address - i.ModuleBase));
-            }
-            var ssdt = symbols.First(sym => sym.Name == "KeServiceDescriptorTable");
-            //var fun = symbols.First(sym => sym.Name == "NtOpenProcess");
-            string hexOutput = String.Format("{0:X}", ssdt.Address - ssdt.ModuleBase);
-            Console.WriteLine("SSDT地址:" + hexOutput);
-            Console.ReadLine();
-            foreach (var i in types)
-            {
-                Console.WriteLine("Type name:" + i.Name);
-            }
-            Console.ReadLine();
-            var type = types.First(sym => sym.Name == "_EPROCESS");
-            var TypeStruct = SymbolHandler.BuildStructDescriptor(BaseAddress, type.Index);
-            foreach (var t in TypeStruct)
-            {
-                Console.WriteLine(t.Name + "|" + t.Offset + "|" + t.Size);
-            }
+            return symbolHandler.BuildStructDescriptor(baseAddress, type.Index);
         }
-
+        
         static void Main(string[] args)
         {
-            while (true)
+            // Get Url
+            string url = BuildUrl("C:\\Windows\\System32\\ntoskrnl.exe");
+            Console.WriteLine(url);
+
+            // Test Pdb Download
+            float progress = 0f;
+            Task task = Task.Factory.StartNew(() => HttpDownload(url, "../../ntkrnlmp.pdb", ref progress));
+
+            // Wait
+            while(!task.IsCompleted)
             {
-                TestReadSymbol();
-                
+                Console.WriteLine("下载中...    " + progress * 100 + "%");
+                Task.Delay(1000).Wait();
             }
+            Console.WriteLine("下载完成！");
+
+            // Test LoadSymbol
+            var ret = LoadSymbol();
+            foreach (var i in ret)
+            {
+                Console.WriteLine("name:" + i.Value.Name);
+            }
+
+            // Test Read Struct
+            var typeStruct = GetStruct(ret["_EPROCESS"]);
+            foreach (var t in typeStruct)
+            {
+                Console.WriteLine(t.Name + " | offset:" + t.Offset + " | size:" + t.Size);
+            }
+
+            Console.ReadLine();
         }
     }
 }
